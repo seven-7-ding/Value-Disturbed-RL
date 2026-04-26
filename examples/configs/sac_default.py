@@ -16,5 +16,6 @@ def get_config():
     config.init_temperature = 1.0
     config.target_entropy = None
     config.backup_entropy = True
+    config.jax_mem_fraction = 0.4  # JAX 可使用的最大 GPU 显存比例 (0.0~1.0)
 
     return config

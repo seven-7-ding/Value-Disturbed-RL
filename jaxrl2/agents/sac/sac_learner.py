@@ -86,6 +86,8 @@ class SACLearner(Agent):
         backup_entropy: bool = True,
         critic_reduction: str = "min",
         init_temperature: float = 1.0,
+        # TODO: add vd_mode.
+        vd_mode: str = "disabled",
     ):
         """
         An implementation of the version of Soft-Actor-Critic described in https://arxiv.org/abs/1812.05905
@@ -125,7 +127,7 @@ class SACLearner(Agent):
             tx=optax.adam(learning_rate=actor_lr),
         )
 
-        critic_def = StateActionEnsemble(hidden_dims, num_qs=2)
+        critic_def = StateActionEnsemble(hidden_dims, num_qs=2, vd_mode=vd_mode)
         critic_params = critic_def.init(critic_key, observations, actions)["params"]
         critic = TrainState.create(
             apply_fn=critic_def.apply,
@@ -147,6 +149,7 @@ class SACLearner(Agent):
         self._target_critic_params = target_critic_params
         self._temp = temp
         self._rng = rng
+        self._vd_mode = vd_mode
 
     def update(self, batch: FrozenDict) -> Dict[str, float]:
         (

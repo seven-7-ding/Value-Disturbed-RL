@@ -10,6 +10,7 @@ class StateActionEnsemble(nn.Module):
     hidden_dims: Sequence[int]
     activations: Callable[[jnp.ndarray], jnp.ndarray] = nn.relu
     num_qs: int = 2
+    vd_mode: str = "disabled"
 
     @nn.compact
     def __call__(self, states, actions, training: bool = False):
@@ -22,7 +23,7 @@ class StateActionEnsemble(nn.Module):
             out_axes=0,
             axis_size=self.num_qs,
         )
-        qs = VmapCritic(self.hidden_dims, activations=self.activations)(
+        qs = VmapCritic(self.hidden_dims, activations=self.activations, vd_mode=self.vd_mode)(
             states, actions, training
         )
         return qs
