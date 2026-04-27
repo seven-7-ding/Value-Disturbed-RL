@@ -15,10 +15,12 @@ def update_actor(
     temp: TrainState,
     batch: DatasetDict,
 ) -> Tuple[TrainState, Dict[str, float]]:
+    key, noise_key = jax.random.split(key)
     def actor_loss_fn(actor_params: Params) -> Tuple[jnp.ndarray, Dict[str, float]]:
         dist = actor.apply_fn({"params": actor_params}, batch["observations"])
         actions, log_probs = dist.sample_and_log_prob(seed=key)
-        qs = critic.apply_fn({"params": critic.params}, batch["observations"], actions)
+        qs = critic.apply_fn({"params": critic.params}, batch["observations"], actions,
+                             rngs={"noise": noise_key})
         q = qs.mean(axis=0)
         actor_loss = (log_probs * temp.apply_fn({"params": temp.params}) - q).mean()
         return actor_loss, {"actor_loss": actor_loss, "entropy": -log_probs.mean()}

@@ -20,6 +20,7 @@ from jaxrl2.networks.normal_tanh_policy import NormalTanhPolicy
 from jaxrl2.networks.values import StateActionEnsemble
 from jaxrl2.types import Params, PRNGKey
 from jaxrl2.utils.target_update import soft_target_update
+from jaxrl2.utils.redo import SACReDo, SACGradientReDo
 
 
 @functools.partial(jax.jit, static_argnames=("backup_entropy", "critic_reduction"))
@@ -70,6 +71,33 @@ def _update_jit(
     )
 
 
+def _collect_activations(train_state: TrainState, obs: np.ndarray) -> Dict:
+    """Run a forward pass with mutable='intermediates' to collect sow'd activations.
+
+    Returns a flat dict  ``{'MLP_0/Dense_0': act, ...}``  suitable for ReDo.
+    The sow calls in MLP store post-activation tensors under 'intermediates'.
+    """
+    _, state = train_state.apply_fn(
+        {'params': train_state.params},
+        obs,
+        mutable=['intermediates'],
+    )
+    # state['intermediates'] is a nested FrozenDict; flatten to slash-paths.
+    intermediates = state.get('intermediates', {})
+
+    flat = {}
+    def _walk(node, prefix):
+        if not (isinstance(node, dict) or hasattr(node, 'items')):
+            # leaf – unwrap sow tuple (sow accumulates as tuples)
+            flat[prefix] = node[0] if isinstance(node, tuple) and len(node) == 1 else node
+            return
+        for k, v in node.items():
+            _walk(v, f'{prefix}/{k}' if prefix else k)
+
+    _walk(intermediates, '')
+    return flat
+
+
 class SACLearner(Agent):
     def __init__(
         self,
@@ -86,8 +114,9 @@ class SACLearner(Agent):
         backup_entropy: bool = True,
         critic_reduction: str = "min",
         init_temperature: float = 1.0,
-        # TODO: add vd_mode.
         vd_mode: str = "disabled",
+        # ReDo config – mirrors the 'redo' block in dreamerv3/configs.yaml
+        redo: Optional[Dict] = None,
     ):
         """
         An implementation of the version of Soft-Actor-Critic described in https://arxiv.org/abs/1812.05905
@@ -110,7 +139,7 @@ class SACLearner(Agent):
         actions = action_space.sample()
 
         rng = jax.random.PRNGKey(seed)
-        rng, actor_key, critic_key, temp_key = jax.random.split(rng, 4)
+        rng, actor_key, critic_key, critic_noise_key, temp_key = jax.random.split(rng, 5)
 
         if np.all(action_space.low == -1) and np.all(action_space.high == 1):
             low = None
@@ -128,7 +157,9 @@ class SACLearner(Agent):
         )
 
         critic_def = StateActionEnsemble(hidden_dims, num_qs=2, vd_mode=vd_mode)
-        critic_params = critic_def.init(critic_key, observations, actions)["params"]
+        critic_params = critic_def.init(
+            {"params": critic_key, "noise": critic_noise_key}, observations, actions
+        )["params"]
         critic = TrainState.create(
             apply_fn=critic_def.apply,
             params=critic_params,
@@ -150,6 +181,61 @@ class SACLearner(Agent):
         self._temp = temp
         self._rng = rng
         self._vd_mode = vd_mode
+
+        # Build ReDo objects from config dict (mirrors configs.yaml 'redo' block).
+        redo = redo or {}
+        redo_kw = dict(
+            tau=redo.get('tau', 0.05),
+            mode=redo.get('mode', 'threshold'),
+            frequency=redo.get('frequency', 1000),
+            log_item=redo.get('log_item', 'disabled'),
+            rank_threshold=redo.get('rank_threshold', 0.99),
+            reset_start=redo.get('reset_start', 0),
+            reset_end=redo.get('reset_end', 0),
+        )
+        # Activation-based ReDo (one instance per network).
+        skip = redo.get('skip_last_layer', False)
+        self._actor_redo  = SACReDo(name='actor',  **redo_kw, skip_last_layer=skip) \
+            if redo.get('redo_enabled', False) else None
+        self._critic_redo = SACReDo(name='critic', **redo_kw, skip_last_layer=skip) \
+            if redo.get('redo_enabled', False) else None
+        # Gradient-based ReDo (one instance per network).
+        grad_kw = {k: v for k, v in redo_kw.items() if k != 'rank_threshold'}
+        self._actor_grad_redo  = SACGradientReDo(name='actor',  **grad_kw) \
+            if redo.get('grad_redo_enabled', False) else None
+        self._critic_grad_redo = SACGradientReDo(name='critic', **grad_kw) \
+            if redo.get('grad_redo_enabled', False) else None
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _apply_act_redo(self, obs: np.ndarray, actions: np.ndarray) -> Dict:
+        """Run activation-based ReDo for actor and/or critic.
+
+        Called only when at least one instance has should_run()==True;
+        each instance whose should_run() is True will do analysis+optional reset.
+        Instances that are not due this step have already been ticked by update().
+        """
+        info = {}
+        rng = self._rng
+
+        if self._actor_redo is not None and self._actor_redo.should_run():
+            act_acts = _collect_activations(self._actor, obs)
+            rng, key = jax.random.split(rng)
+            new_p, mets = self._actor_redo.step(self._actor.params, act_acts, key)
+            self._actor = self._actor.replace(params=new_p)
+            info.update(mets)
+
+        if self._critic_redo is not None and self._critic_redo.should_run():
+            crit_acts = _collect_activations_critic(self._critic, obs, actions)
+            rng, key = jax.random.split(rng)
+            new_p, mets = self._critic_redo.step(self._critic.params, crit_acts, key)
+            self._critic = self._critic.replace(params=new_p)
+            info.update(mets)
+
+        self._rng = rng
+        return info
 
     def update(self, batch: FrozenDict) -> Dict[str, float]:
         (
@@ -179,4 +265,129 @@ class SACLearner(Agent):
         self._target_critic_params = new_target_critic_params
         self._temp = new_temp
 
+        # --- Activation-based ReDo ---
+        # Gate the call so np.asarray is only done when needed.
+        act_redo_due = (
+            (self._actor_redo  is not None and self._actor_redo.should_run()) or
+            (self._critic_redo is not None and self._critic_redo.should_run())
+        )
+        # Always tick counters even if we skip work.
+        if self._actor_redo is not None and not self._actor_redo.should_run():
+            self._actor_redo._step += 1
+        if self._critic_redo is not None and not self._critic_redo.should_run():
+            self._critic_redo._step += 1
+        if act_redo_due:
+            obs     = np.asarray(batch['observations'])
+            actions = np.asarray(batch['actions'])
+            info.update(self._apply_act_redo(obs, actions))
+
+        # --- Gradient-based ReDo ---
+        # Re-compute gradients only when should_run() is True.
+        if self._actor_grad_redo is not None:
+            if self._actor_grad_redo.should_run():
+                self._rng, key = jax.random.split(self._rng)
+                new_p, _, mets = self._actor_grad_redo.step(
+                    self._actor.params,
+                    _compute_actor_grads(self._actor, self._critic, self._temp, batch),
+                    key,
+                )
+                self._actor = self._actor.replace(params=new_p)
+                info.update(mets)
+            else:
+                self._actor_grad_redo._step += 1  # keep counter in sync
+
+        if self._critic_grad_redo is not None:
+            if self._critic_grad_redo.should_run():
+                self._rng, key = jax.random.split(self._rng)
+                new_p, _, mets = self._critic_grad_redo.step(
+                    self._critic.params,
+                    _compute_critic_grads(
+                        self._actor, self._critic, self._target_critic_params,
+                        self._temp, batch, self.discount, self.backup_entropy, self.critic_reduction
+                    ),
+                    key,
+                )
+                self._critic = self._critic.replace(params=new_p)
+                info.update(mets)
+            else:
+                self._critic_grad_redo._step += 1  # keep counter in sync
+
         return info
+
+
+# ---------------------------------------------------------------------------
+# Helpers for activation / gradient collection outside JIT
+# ---------------------------------------------------------------------------
+
+def _collect_activations_critic(critic_state: TrainState,
+                                 obs: np.ndarray,
+                                 actions: np.ndarray) -> Dict:
+    """Collect activations from the critic network.
+
+    The critic uses nn.vmap (num_qs=2), so each sow'd tensor has an extra
+    leading vmap axis.  We take critic index 0 for dormancy analysis – both
+    critics share the same architecture so the result is representative.
+    """
+    noise_key = jax.random.PRNGKey(0)
+    _, state = critic_state.apply_fn(
+        {'params': critic_state.params},
+        obs, actions,
+        mutable=['intermediates'],
+        rngs={'noise': noise_key},
+    )
+    intermediates = state.get('intermediates', {})
+    flat = {}
+    def _walk(node, prefix):
+        if not (isinstance(node, dict) or hasattr(node, 'items')):
+            # Sow accumulates as 1-tuples; vmap stacks along axis 0 → shape (num_qs, batch, hidden).
+            # Unwrap tuple, then take critic 0.
+            v = node[0] if isinstance(node, tuple) and len(node) == 1 else node
+            if hasattr(v, 'ndim') and v.ndim >= 2:
+                v = v[0]   # take first critic
+            flat[prefix] = v
+            return
+        for k, v in node.items():
+            _walk(v, f'{prefix}/{k}' if prefix else k)
+    _walk(intermediates, '')
+    return flat
+
+
+def _compute_actor_grads(actor, critic, temp, batch):
+    """Re-compute actor gradients for gradient-based ReDo (outside JIT)."""
+    from jaxrl2.agents.sac.actor_updater import update_actor
+    import jax
+    rng = jax.random.PRNGKey(0)
+    rng, noise_key = jax.random.split(rng)
+    def actor_loss_fn(actor_params):
+        dist = actor.apply_fn({'params': actor_params}, batch['observations'])
+        actions, log_probs = dist.sample_and_log_prob(seed=rng)
+        qs = critic.apply_fn({'params': critic.params}, batch['observations'], actions,
+                             rngs={'noise': noise_key})
+        q = qs.mean(axis=0)
+        return (log_probs * temp.apply_fn({'params': temp.params}) - q).mean(), {}
+    grads, _ = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
+    return grads
+
+
+def _compute_critic_grads(actor, critic, target_params, temp, batch,
+                           discount, backup_entropy, critic_reduction):
+    """Re-compute critic gradients for gradient-based ReDo (outside JIT)."""
+    import jax
+    from jaxrl2.agents.sac.critic_updater import update_critic
+    rng = jax.random.PRNGKey(0)
+    rng, noise_key1, noise_key2 = jax.random.split(rng, 3)
+    target_critic = critic.replace(params=target_params)
+    dist = actor.apply_fn({'params': actor.params}, batch['next_observations'])
+    next_actions, next_log_probs = dist.sample_and_log_prob(seed=rng)
+    next_qs = target_critic.apply_fn({'params': target_params}, batch['next_observations'], next_actions,
+                                      rngs={'noise': noise_key1})
+    next_q = next_qs.min(axis=0) if critic_reduction == 'min' else next_qs.mean(axis=0)
+    target_q = batch['rewards'] + discount * batch['masks'] * next_q
+    if backup_entropy:
+        target_q -= discount * batch['masks'] * temp.apply_fn({'params': temp.params}) * next_log_probs
+    def critic_loss_fn(critic_params):
+        qs = critic.apply_fn({'params': critic_params}, batch['observations'], batch['actions'],
+                             rngs={'noise': noise_key2})
+        return ((qs - target_q) ** 2).mean(), {}
+    grads, _ = jax.grad(critic_loss_fn, has_aux=True)(critic.params)
+    return grads

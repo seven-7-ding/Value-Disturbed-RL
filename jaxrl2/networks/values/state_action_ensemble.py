@@ -17,8 +17,8 @@ class StateActionEnsemble(nn.Module):
 
         VmapCritic = nn.vmap(
             StateActionValue,
-            variable_axes={"params": 0},
-            split_rngs={"params": True},
+            variable_axes={"params": 0, "intermediates": 0},
+            split_rngs={"params": True, "noise": True},
             in_axes=None,
             out_axes=0,
             axis_size=self.num_qs,

@@ -1,4 +1,3 @@
-from math import dist
 from typing import Callable, Optional, Sequence, Union
 
 import flax.linen as nn
@@ -29,9 +28,9 @@ class MLP(nn.Module):
 
         for i, size in enumerate(self.hidden_dims):
             if i + 1 == len(self.hidden_dims) and self.scale_final is not None:
-                x = nn.Dense(size, kernel_init=default_init(self.scale_final))(x)
+                x = nn.Dense(size, kernel_init=default_init(self.scale_final), name=f'layer_{i}')(x)
             else:
-                x = nn.Dense(size, kernel_init=default_init())(x)
+                x = nn.Dense(size, kernel_init=default_init(), name=f'layer_{i}')(x)
 
             if i + 1 < len(self.hidden_dims) or self.activate_final:
                 x = self.activations(x)
@@ -39,6 +38,8 @@ class MLP(nn.Module):
                     x = nn.Dropout(rate=self.dropout_rate)(
                         x, deterministic=not training
                     )
+                if self.is_mutable_collection('intermediates'):
+                    self.sow('intermediates', f'layer_{i}_act', x)
         return x
 
 class RIMLP(nn.Module):
@@ -60,9 +61,9 @@ class RIMLP(nn.Module):
 
         for i, size in enumerate(self.hidden_dims):
             if i + 1 == len(self.hidden_dims) and self.scale_final is not None:
-                x = nn.Dense(size, kernel_init=default_init(self.scale_final))(x)
+                x = nn.Dense(size, kernel_init=default_init(self.scale_final), name=f'layer_{i}')(x)
             else:
-                x = nn.Dense(size, kernel_init=default_init())(x)
+                x = nn.Dense(size, kernel_init=default_init(), name=f'layer_{i}')(x)
 
             if i + 1 < len(self.hidden_dims) or self.activate_final:
                 x = self.activations(x)
@@ -70,6 +71,8 @@ class RIMLP(nn.Module):
                     x = nn.Dropout(rate=self.dropout_rate)(
                         x, deterministic=not training
                     )
+                if self.is_mutable_collection('intermediates'):
+                    self.sow('intermediates', f'layer_{i}_act', x)
             if self.noise_layer is not None and (
                 (self.noise_layer == "first" and i == 0) or
                 (self.noise_layer == "last" and i + 2 == len(self.hidden_dims))
@@ -97,9 +100,9 @@ class RAMLP(nn.Module):
 
         for i, size in enumerate(self.hidden_dims):
             if i + 1 == len(self.hidden_dims) and self.scale_final is not None:
-                x = nn.Dense(size, kernel_init=default_init(self.scale_final))(x)
+                x = nn.Dense(size, kernel_init=default_init(self.scale_final), name=f'layer_{i}')(x)
             else:
-                x = nn.Dense(size, kernel_init=default_init())(x)
+                x = nn.Dense(size, kernel_init=default_init(), name=f'layer_{i}')(x)
 
             if i + 1 < len(self.hidden_dims) or self.activate_final:
                 x = self.activations(x)
@@ -107,14 +110,18 @@ class RAMLP(nn.Module):
                     x = nn.Dropout(rate=self.dropout_rate)(
                         x, deterministic=not training
                     )
+                if self.is_mutable_collection('intermediates'):
+                    self.sow('intermediates', f'layer_{i}_act', x)
             if self.noise_layer is not None and (
                 (self.noise_layer == "first" and i == 0) or
                 (self.noise_layer == "last" and i + 2 == len(self.hidden_dims))
             ):
                 if self.dist_type == "gaussian":
-                    _std = nn.Dense(size, kernel_init=default_init())(x)
+                    _std = nn.Dense(size, kernel_init=default_init(), name=f'std_{i}_fc0')(x)
                     _std = self.activations(_std)
-                    _std = nn.Dense(size, kernel_init=default_init())(_std)
+                    if self.is_mutable_collection('intermediates'):
+                        self.sow('intermediates', f'std_{i}_fc0_act', _std)
+                    _std = nn.Dense(size, kernel_init=default_init(), name=f'std_{i}_fc1')(_std)
                     _std = jnp.clip(_std, 1e-6)
                     x = x + _std * jnp.clip(jax.random.normal(self.make_rng("noise"), x.shape), -1.0, 1.0)
                 else:

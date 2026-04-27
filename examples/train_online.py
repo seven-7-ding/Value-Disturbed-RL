@@ -45,7 +45,7 @@ config_flags.DEFINE_config_file(
 def main(_):
     kwargs = dict(FLAGS.config)
     kwargs.pop("jax_mem_fraction", None)  # consumed at module top; not passed to SACLearner
-    utd = kwargs.pop("utd", 1)
+    utd = FLAGS.utd
 
     project_name, group_name, run_name = FLAGS.save_dir.split("/")[-3:]
     wandb.init(
@@ -108,7 +108,7 @@ def main(_):
         if i >= FLAGS.start_training:
             if i == FLAGS.start_training and FLAGS.prim:
                 print("Start primming...")
-                for _ in range(1e6):  # primming with 20x UTD steps
+                for _ in range(1e5):  # primming with 20x UTD steps
                     batch = replay_buffer.sample(FLAGS.batch_size)
                     agent.update(batch)
                 print("Start training...")
