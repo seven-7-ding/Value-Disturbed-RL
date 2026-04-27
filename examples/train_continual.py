@@ -85,7 +85,7 @@ def main(_):
     kwargs = dict(FLAGS.config)
     kwargs.pop("jax_mem_fraction", None)
     redo_cfg = dict(kwargs.pop("redo", {}))
-    redo_cfg["frequency"] = redo_cfg.get("frequency", 640000) * FLAGS.utd
+    redo_cfg["frequency"] = redo_cfg["frequency"] * FLAGS.utd
     print(f"Effective ReDo frequency (in env steps): {redo_cfg['frequency']}")
 
     task_list = [t.strip() for t in FLAGS.tasks.split(',')]
@@ -176,9 +176,11 @@ def main(_):
 
         # ---- training ----
         if task_local >= FLAGS.start_training:
+            update_info = {}
             for _ in range(FLAGS.utd):
-                batch       = replay_buffer.sample(FLAGS.batch_size)
-                update_info = agent.update(batch)
+                batch     = replay_buffer.sample(FLAGS.batch_size)
+                step_info = agent.update(batch)
+                update_info.update(step_info)   # redo metrics appear in whichever call they fire
 
             has_redo = any('redo' in k for k in update_info) or any('grad_redo' in k for k in update_info)
             if FLAGS.wandb and (global_step % FLAGS.log_interval == 0 or has_redo):
@@ -200,7 +202,7 @@ def main(_):
             cur_task = task_schedule[task_idx]
             print(f'[{cur_task} | step {global_step}] return={eval_info["return"]:.1f}')
             if FLAGS.wandb:
-                wandb.log({f'performance/{k}': v
+                wandb.log({f'performance/{cur_task}/{k}': v
                            for k, v in eval_info.items()}, step=global_step)
 
         global_step += 1

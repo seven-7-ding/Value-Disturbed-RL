@@ -77,7 +77,8 @@ class RIMLP(nn.Module):
                 (self.noise_layer == "first" and i == 0) or
                 (self.noise_layer == "last" and i + 2 == len(self.hidden_dims))
             ):
-                noise = self.relative_noise_scale * jnp.abs(x) * jnp.clip(jax.random.normal(self.make_rng("noise"), x.shape), -1.0, 1.0)
+                noise = self.relative_noise_scale * jax.lax.stop_gradient(jnp.abs(x)) * jnp.clip(jax.random.normal(self.make_rng("noise"), x.shape), -1.0, 1.0)
+                # noise = self.relative_noise_scale * jnp.abs(x) * jnp.clip(jax.random.normal(self.make_rng("noise"), x.shape), -1.0, 1.0)
                 x = x + noise
         return x
 
