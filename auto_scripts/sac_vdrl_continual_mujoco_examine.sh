@@ -4,7 +4,7 @@
 cd /home/jiale/MBRL/VDRL
 
 # Available CUDA devices (modify as needed)
-CUDA_DEVICES=(0 1 2 6 7 0 1 2 6 7 0 1 2 6 7 0 1 2 6 7)  # Modify to your available GPUs
+CUDA_DEVICES=(6 7 6 7 0 1 2 3 4 5 6 7 6 7 6 7 0 1 2 3 4 5 6 7)  # Modify to your available GPUs
 
 # Maximum runs per GPU
 MAX_RUNS_PER_GPU=1  # Adjust based on GPU memory
