@@ -6,6 +6,7 @@ from typing import Dict, Optional, Sequence, Tuple
 
 import gym
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 from flax.core.frozen_dict import FrozenDict
@@ -182,6 +183,17 @@ class SACLearner(Agent):
         self._rng = rng
         self._vd_mode = vd_mode
 
+        # Save construction state for reset_agent().
+        self._actor_def       = actor_def
+        self._critic_def      = critic_def
+        self._temp_def        = temp_def
+        self._actor_lr        = actor_lr
+        self._critic_lr       = critic_lr
+        self._temp_lr         = temp_lr
+        self._init_temperature = init_temperature
+        self._observations_sample = observations
+        self._actions_sample      = actions
+
         # Build ReDo objects from config dict (mirrors configs.yaml 'redo' block).
         redo = redo or {}
         redo_kw = dict(
@@ -193,6 +205,7 @@ class SACLearner(Agent):
             reset_start=redo.get('reset_start', 0),
             reset_end=redo.get('reset_end', 0),
         )
+        self._rank_threshold = redo_kw['rank_threshold']
         # Activation-based ReDo (one instance per network).
         skip = redo.get('skip_last_layer', False)
         self._actor_redo  = SACReDo(name='actor',  **redo_kw, skip_last_layer=skip) \
@@ -205,6 +218,50 @@ class SACLearner(Agent):
             if redo.get('grad_redo_enabled', False) else None
         self._critic_grad_redo = SACGradientReDo(name='critic', **grad_kw) \
             if redo.get('grad_redo_enabled', False) else None
+
+    # ------------------------------------------------------------------
+    # Agent reset
+    # ------------------------------------------------------------------
+
+    def reset_agent(self) -> None:
+        """Reinitialise all network parameters and optimiser states from scratch.
+
+        Called when vd_mode == 'reset_all' at every task switch.
+        ReDo step counters are also reset so frequency gating restarts cleanly.
+        """
+        self._rng, actor_key, critic_key, critic_noise_key, temp_key = \
+            jax.random.split(self._rng, 5)
+
+        actor_params = self._actor_def.init(actor_key, self._observations_sample)["params"]
+        self._actor = self._actor.replace(
+            params=actor_params,
+            opt_state=optax.adam(learning_rate=self._actor_lr).init(actor_params),
+            step=0,
+        )
+
+        critic_params = self._critic_def.init(
+            {"params": critic_key, "noise": critic_noise_key},
+            self._observations_sample, self._actions_sample
+        )["params"]
+        self._critic = self._critic.replace(
+            params=critic_params,
+            opt_state=optax.adam(learning_rate=self._critic_lr).init(critic_params),
+            step=0,
+        )
+        self._target_critic_params = copy.deepcopy(critic_params)
+
+        temp_params = self._temp_def.init(temp_key)["params"]
+        self._temp = self._temp.replace(
+            params=temp_params,
+            opt_state=optax.adam(learning_rate=self._temp_lr).init(temp_params),
+            step=0,
+        )
+
+        # Reset ReDo step counters.
+        for obj in (self._actor_redo, self._critic_redo,
+                    self._actor_grad_redo, self._critic_grad_redo):
+            if obj is not None:
+                obj._step = 0
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -236,6 +293,52 @@ class SACLearner(Agent):
 
         self._rng = rng
         return info
+
+    def collect_noised_act_stats(self, observations: np.ndarray, actions: np.ndarray) -> Dict:
+        """Compute erank/srank of critic noised activations over aggregated UTD data.
+
+        Runs a single critic forward pass on all concatenated mini-batches from
+        the UTD loop, then analyses only ``*_noised_act`` intermediates.
+        Returns an empty dict when the critic has no noised activations
+        (e.g. vd_mode == 'disabled').
+        """
+        from jaxrl2.utils.redo import _effective_rank, _stable_rank, f32
+        noise_key = jax.random.PRNGKey(0)
+        _, state = self._critic.apply_fn(
+            {'params': self._critic.params},
+            observations, actions,
+            mutable=['intermediates'],
+            rngs={'noise': noise_key},
+        )
+        intermediates = state.get('intermediates', {})
+        metrics = {}
+
+        def _walk(node, prefix):
+            if not (isinstance(node, dict) or hasattr(node, 'items')):
+                v = node[0] if isinstance(node, tuple) and len(node) == 1 else node
+                if prefix.endswith('_noised_act') and hasattr(v, 'ndim') and v.ndim >= 2:
+                    lname = prefix.rsplit('/', 1)[-1]
+                    # vmap stacks along axis 0 → shape (num_qs, batch, hidden)
+                    if v.ndim == 3:
+                        for qi in range(v.shape[0]):
+                            act_2d = f32(v[qi]).reshape(-1, v[qi].shape[-1])
+                            sv = jnp.linalg.svd(act_2d, compute_uv=False)
+                            pfx = f'critic_{qi}'
+                            metrics[f'{pfx}/redo_noised_agg/erank/{lname}'] = float(_effective_rank(sv))
+                            metrics[f'{pfx}/redo_noised_agg/srank/{lname}'] = float(
+                                _stable_rank(sv, self._rank_threshold))
+                    else:  # ndim == 2: (batch, hidden) — non-vmapped fallback
+                        act_2d = f32(v)
+                        sv = jnp.linalg.svd(act_2d, compute_uv=False)
+                        metrics[f'critic/redo_noised_agg/erank/{lname}'] = float(_effective_rank(sv))
+                        metrics[f'critic/redo_noised_agg/srank/{lname}'] = float(
+                            _stable_rank(sv, self._rank_threshold))
+                return
+            for k, v_node in node.items():
+                _walk(v_node, f'{prefix}/{k}' if prefix else k)
+
+        _walk(intermediates, '')
+        return metrics
 
     def update(self, batch: FrozenDict) -> Dict[str, float]:
         (

@@ -17,23 +17,64 @@ from dm_control import suite
 
 # Common dm_control proprio observation sizes (flattened).
 TASK_OBS_DIMS = {
-    'cartpole_balance':    5,
-    'cartpole_swingup':    5,
-    'reacher_easy':        6,
-    'reacher_hard':        6,
-    'finger_spin':         9,
-    'ball_in_cup_catch':   8,
-    'pendulum_swingup':    3,
-    'acrobot_swingup':     6,
-    'cheetah_run':        17,
-    'hopper_hop':         15,
-    'hopper_stand':       15,
-    'walker_walk':        24,
-    'walker_run':         24,
-    'walker_stand':       24,
-    'humanoid_walk':      67,
-    'humanoid_run':       67,
-    'dog_walk':          223,
+    # --- acrobot ---
+    'acrobot_swingup':         6,
+    'acrobot_swingup_sparse':  6,
+    # --- ball_in_cup ---
+    'ball_in_cup_catch':       8,
+    # --- cartpole ---
+    'cartpole_balance':        5,
+    'cartpole_balance_sparse': 5,
+    'cartpole_swingup':        5,
+    'cartpole_swingup_sparse': 5,
+    'cartpole_two_poles':      8,
+    # --- cheetah ---
+    'cheetah_run':            17,
+    # --- dog ---
+    'dog_fetch':             223,
+    'dog_run':               223,
+    'dog_stand':             223,
+    'dog_trot':              223,
+    'dog_walk':              223,
+    # --- finger ---
+    'finger_spin':             9,
+    'finger_turn_easy':        9,
+    'finger_turn_hard':        9,
+    # --- fish ---
+    'fish_swim':              24,
+    'fish_upright':           24,
+    # --- hopper ---
+    'hopper_hop':             15,
+    'hopper_stand':           15,
+    # --- humanoid ---
+    'humanoid_run':           67,
+    'humanoid_stand':         67,
+    'humanoid_walk':          67,
+    # --- manipulator ---
+    'manipulator_bring_ball': 44,
+    'manipulator_bring_peg':  44,
+    'manipulator_insert_ball':44,
+    'manipulator_insert_peg': 44,
+    # --- pendulum ---
+    'pendulum_swingup':        3,
+    # --- point_mass ---
+    'point_mass_easy':         4,
+    'point_mass_hard':         4,
+    # --- quadruped ---
+    'quadruped_escape':       78,
+    'quadruped_fetch':        78,
+    'quadruped_run':          78,
+    'quadruped_walk':         78,
+    # --- reacher ---
+    'reacher_easy':            6,
+    'reacher_hard':            6,
+    # --- swimmer ---
+    'swimmer_swimmer6':       24,
+    'swimmer_swimmer15':      24,
+    # --- walker ---
+    'walker_run':             24,
+    'walker_stand':           24,
+    'walker_walk':            24,
 }
 
 
@@ -56,6 +97,10 @@ class ContinualDMCEnv(gym.Env):
     ):
         super().__init__()
         assert len(task_list) > 0
+
+        # Pre-check: probe all unique tasks and adjust dims upward if needed.
+        obs_dim, act_dim = self._check_dims(task_list, obs_dim, act_dim, seed)
+
         self.task_list = task_list
         self.obs_dim   = obs_dim
         self.act_dim   = act_dim
@@ -75,6 +120,53 @@ class ContinualDMCEnv(gym.Env):
         self._act_low      = None   # gym task only
         self._act_high     = None   # gym task only
         self._load_task(self.task_list[0])
+
+    # ------------------------------------------------------------------
+    # Dim pre-check
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _check_dims(task_list: list, obs_dim: int, act_dim: int, seed: int):
+        """Probe each unique task once; warn and auto-adjust dims if too small."""
+        max_obs = obs_dim
+        max_act = act_dim
+        warn_obs, warn_act = [], []
+
+        for task_name in dict.fromkeys(task_list):   # unique, order-preserving
+            if _is_gym_task(task_name):
+                raw = gym.make(task_name)
+                real_obs = raw.observation_space.shape[0]
+                real_act = raw.action_space.shape[0]
+                raw.close()
+            else:
+                domain, task = task_name.split('_', 1)
+                if domain == 'cup':
+                    domain = 'ball_in_cup'
+                dm_env = suite.load(domain, task, task_kwargs={'random': seed})
+                ts = dm_env.reset()
+                real_obs = sum(np.asarray(v).flatten().shape[0]
+                               for v in ts.observation.values())
+                real_act = dm_env.action_spec().shape[0]
+
+            if real_obs > obs_dim:
+                warn_obs.append((task_name, real_obs))
+                max_obs = max(max_obs, real_obs)
+            if real_act > act_dim:
+                warn_act.append((task_name, real_act))
+                max_act = max(max_act, real_act)
+
+        if warn_obs:
+            print(f'[ContinualDMCEnv] WARNING: obs_dim={obs_dim} is too small:')
+            for t, d in warn_obs:
+                print(f'  {t}: real_obs={d}')
+            print(f'  → auto-adjusting obs_dim: {obs_dim} → {max_obs}')
+        if warn_act:
+            print(f'[ContinualDMCEnv] WARNING: act_dim={act_dim} is too small:')
+            for t, d in warn_act:
+                print(f'  {t}: real_act={d}')
+            print(f'  → auto-adjusting act_dim: {act_dim} → {max_act}')
+
+        return max_obs, max_act
 
     # ------------------------------------------------------------------
     # Task management

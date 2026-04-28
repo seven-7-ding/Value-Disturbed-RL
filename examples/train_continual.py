@@ -151,6 +151,10 @@ def main(_):
             eval_env = make_eval_env(
                 cur_task, FLAGS.obs_dim, FLAGS.act_dim, FLAGS.seed + 42)
             task_local = 0
+            # reset_all: reinitialise the full SAC agent on every task switch.
+            if 'reset_all' in FLAGS.vd_mode:
+                agent.reset_agent()
+                print(f'  → agent fully reset (vd_mode=reset_all)')
 
         # ---- collect one step ----
         if task_local < FLAGS.start_training:
@@ -177,16 +181,32 @@ def main(_):
         # ---- training ----
         if task_local >= FLAGS.start_training:
             update_info = {}
+            utd_obs, utd_actions = [], []
             for _ in range(FLAGS.utd):
                 batch     = replay_buffer.sample(FLAGS.batch_size)
                 step_info = agent.update(batch)
                 update_info.update(step_info)   # redo metrics appear in whichever call they fire
+                utd_obs.append(np.asarray(batch['observations']))
+                utd_actions.append(np.asarray(batch['actions']))
+
+            # Aggregated noised-activation rank analysis (fires at same frequency as ReDo).
+            if any('redo' in k for k in update_info):
+                update_info.update(agent.collect_noised_act_stats(
+                    np.concatenate(utd_obs,     axis=0),
+                    np.concatenate(utd_actions, axis=0),
+                ))
 
             has_redo = any('redo' in k for k in update_info) or any('grad_redo' in k for k in update_info)
             if FLAGS.wandb and (global_step % FLAGS.log_interval == 0 or has_redo):
                 log_dict = {}
                 for k, v in update_info.items():
-                    if '/redo/' in k:
+                    if '/redo_noised_agg/' in k:
+                        net, _, rest = k.partition('/redo_noised_agg/')
+                        log_dict[f'redo_noised_agg/{net}/{rest}'] = v
+                    elif '/redo_noised/' in k:
+                        net, _, rest = k.partition('/redo_noised/')
+                        log_dict[f'redo_noised/{net}/{rest}'] = v
+                    elif '/redo/' in k:
                         net, _, rest = k.partition('/redo/')
                         log_dict[f'redo/{net}/{rest}'] = v
                     elif '/grad_redo/' in k:

@@ -40,6 +40,8 @@ class MLP(nn.Module):
                     )
                 if self.is_mutable_collection('intermediates'):
                     self.sow('intermediates', f'layer_{i}_act', x)
+                if self.is_mutable_collection('intermediates'):
+                    self.sow('intermediates', f'layer_{i}_noised_act', x)
         return x
 
 class RIMLP(nn.Module):
@@ -80,6 +82,8 @@ class RIMLP(nn.Module):
                 noise = self.relative_noise_scale * jax.lax.stop_gradient(jnp.abs(x)) * jnp.clip(jax.random.normal(self.make_rng("noise"), x.shape), -1.0, 1.0)
                 # noise = self.relative_noise_scale * jnp.abs(x) * jnp.clip(jax.random.normal(self.make_rng("noise"), x.shape), -1.0, 1.0)
                 x = x + noise
+                if self.is_mutable_collection('intermediates'):
+                    self.sow('intermediates', f'layer_{i}_noised_act', x)
         return x
 
 class RAMLP(nn.Module):
@@ -123,8 +127,11 @@ class RAMLP(nn.Module):
                     if self.is_mutable_collection('intermediates'):
                         self.sow('intermediates', f'std_{i}_fc0_act', _std)
                     _std = nn.Dense(size, kernel_init=default_init(), name=f'std_{i}_fc1')(_std)
-                    _std = jnp.clip(_std, 1e-6)
+                    if self.is_mutable_collection('intermediates'):
+                        self.sow('intermediates', f'std_{i}_fc1_act', _std)
                     x = x + _std * jnp.clip(jax.random.normal(self.make_rng("noise"), x.shape), -1.0, 1.0)
+                    if self.is_mutable_collection('intermediates'):
+                        self.sow('intermediates', f'layer_{i}_noised_act', x)
                 else:
                     raise ValueError(f"Invalid dist_type: {self.dist_type}")
         return x

@@ -188,30 +188,34 @@ class SACReDo:
             # Strip the '_act' suffix to get the Dense layer path, then look up kernel.
             if not path.endswith('_act'):
                 continue
-            layer_path = path[:-4]   # remove '_act'
+            is_noised = path.endswith('_noised_act')
+            if is_noised:
+                layer_path = path[:-len('_noised_act')]
+            else:
+                layer_path = path[:-4]   # remove '_act'
             kernel = _get(flat_p, layer_path + '/kernel')
             if kernel is None:
                 continue
 
             score      = _neuron_score(act)
             norm_score = score / (score.mean() + 1e-9)
-            # Use only the last path component so that MLP / RIMLP / RAMLP
-            # all produce identical layer names (e.g. 'layer_0_act').
             lname = path.rsplit('/', 1)[-1]
+            # noised activations go into a separate 'redo_noised' group
+            group = 'redo_noised' if is_noised else 'redo'
 
             pfx = self.name
             for t in _TAU_LIST:
-                metrics[f'{pfx}/redo/Dormant_{t}/{lname}'] = float(
+                metrics[f'{pfx}/{group}/Dormant_{t}/{lname}'] = float(
                     f32(norm_score <= t).mean() * 100)
-            metrics[f'{pfx}/redo/Act_Mean/{lname}'] = float(score.mean())
+            metrics[f'{pfx}/{group}/Act_Mean/{lname}'] = float(score.mean())
 
             if need_erank or need_srank:
                 act_2d = f32(act).reshape(-1, act.shape[-1])
                 sv = jnp.linalg.svd(act_2d, compute_uv=False)
                 if need_erank:
-                    metrics[f'{pfx}/redo/erank/{lname}'] = float(_effective_rank(sv))
+                    metrics[f'{pfx}/{group}/erank/{lname}'] = float(_effective_rank(sv))
                 if need_srank:
-                    metrics[f'{pfx}/redo/srank/{lname}'] = float(
+                    metrics[f'{pfx}/{group}/srank/{lname}'] = float(
                         _stable_rank(sv, self.rank_threshold))
 
             if not do_reset:

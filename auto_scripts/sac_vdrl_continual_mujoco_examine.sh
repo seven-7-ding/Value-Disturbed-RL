@@ -4,14 +4,13 @@
 cd /home/jiale/MBRL/VDRL
 
 # Available CUDA devices (modify as needed)
-CUDA_DEVICES=(1 2 6 7 0 1 2 6 7)  # Modify to your available GPUs
+CUDA_DEVICES=(0 1 2 6 7 0 1 2 6 7 0 1 2 6 7 0 1 2 6 7)  # Modify to your available GPUs
 
 # Maximum runs per GPU
 MAX_RUNS_PER_GPU=1  # Adjust based on GPU memory
 
 # Training configuration
-UTD=16
-SUFFIX=mujoco_examine
+SUFFIX=dmc_mujoco_examine
 
 # ReDo settings (passed via --config.redo.* flags)
 REDO_ENABLED=True
@@ -19,32 +18,48 @@ REDO_LOG_ITEM="log+erank+srank"
 REDO_FREQUENCY=10000
 
 # Continual task settings
-# TASKS_STR="cheetah_run,walker_walk,hopper_hop"
-# OBS_DIM=64
-TASKS_STR="HalfCheetah-v4,Walker2d-v4,Hopper-v4"
+TASKS_STR="finger_turn_easy,walker_walk,cheetah_run,swimmer_swimmer6,fish_swim"
 OBS_DIM=32
+# TASKS_STR="HalfCheetah-v4,Walker2d-v4,Hopper-v4"
+# OBS_DIM=32
 ACT_DIM=6
-TASK_STEPS=100000
+TASK_STEPS=200000
 TASK_REPEATS=10
-START_TRAINING=1000
+START_TRAINING=10000
 
 # Base log directory
 BASE_LOGDIR=./logdir
 
 # ============= Settings Definition =============
-# Format: "vd_mode|seed"
+# Format: "vd_mode|seed|utd"
 declare -a SETTINGS=(
-    "disabled|1000"
-    "disabled|2000"
-    "disabled|3000"
+    "disabled|1000|1"
+    "disabled|2000|1"
+    "disabled|3000|1"
 
-    "RI_first_std_sg|1000"
-    "RI_first_std_sg|2000"
-    "RI_first_std_sg|3000"
+    "disabled|1000|16"
+    "disabled|2000|16"
+    "disabled|3000|16"
 
-    "RA_first_gaussian|1000"
-    "RA_first_gaussian|2000"
-    "RA_first_gaussian|3000"
+    "reset_all_disabled|1000|1"
+    "reset_all_disabled|2000|1"
+    "reset_all_disabled|3000|1"
+
+    "reset_all_disabled|1000|16"
+    "reset_all_disabled|2000|16"
+    "reset_all_disabled|3000|16"
+
+    "RI_first_std_sg|1000|1"
+    "RI_first_std_sg|2000|1"
+    "RI_first_std_sg|3000|1"
+
+    "RI_first_std_sg|1000|16"
+    "RI_first_std_sg|2000|16"
+    "RI_first_std_sg|3000|16"
+
+    # "RA_first_gaussian|1000|1"
+    # "RA_first_gaussian|2000|1"
+    # "RA_first_gaussian|3000|1"
 )
 
 # ============= Initialize =============
@@ -62,7 +77,7 @@ echo "Total runs requested: $TOTAL_RUNS"
 echo "Total GPU capacity: $TOTAL_CAPACITY (${#CUDA_DEVICES[@]} GPUs × $MAX_RUNS_PER_GPU runs/GPU)"
 echo "Using GPUs: ${CUDA_DEVICES[@]}"
 echo "Tasks: $TASKS_STR"
-echo "UTD: $UTD  |  task_steps: $TASK_STEPS  |  task_repeats: $TASK_REPEATS"
+echo "UTD: varies per setting  |  task_steps: $TASK_STEPS  |  task_repeats: $TASK_REPEATS"
 echo ""
 
 if [ $TOTAL_RUNS -gt $TOTAL_CAPACITY ]; then
@@ -72,13 +87,13 @@ if [ $TOTAL_RUNS -gt $TOTAL_CAPACITY ]; then
 fi
 
 for setting_spec in "${SETTINGS[@]}"; do
-    IFS='|' read -r vd_mode seed <<< "$setting_spec"
-    combined="${vd_mode}|${seed}"
+    IFS='|' read -r vd_mode seed utd <<< "$setting_spec"
+    combined="${vd_mode}|${seed}|${utd}"
 
     # Check if we've reached capacity
     if [ $run_counter -ge $TOTAL_CAPACITY ]; then
         FAILED_DEPLOYMENTS+=("$combined")
-        echo "❌ [$((run_counter + 1))/$TOTAL_RUNS] SKIPPED: $vd_mode / seed $seed (GPU capacity reached)"
+        echo "❌ [$((run_counter + 1))/$TOTAL_RUNS] SKIPPED: $vd_mode / seed $seed / utd $utd (GPU capacity reached)"
         run_counter=$((run_counter + 1))
         continue
     fi
@@ -88,10 +103,10 @@ for setting_spec in "${SETTINGS[@]}"; do
     device_num=${CUDA_DEVICES[$gpu_idx]}
 
     # Create log directory
-    logdir="${BASE_LOGDIR}/continual_sac_${SUFFIX}/${vd_mode}_utd_${UTD}/seed_${seed}"
+    logdir="${BASE_LOGDIR}/continual_sac_${SUFFIX}/${vd_mode}_utd_${utd}/seed_${seed}"
     mkdir -p "$logdir"
 
-    echo "✅ [$((run_counter + 1))/$TOTAL_RUNS] Launching: $vd_mode | seed $seed on GPU $device_num"
+    echo "✅ [$((run_counter + 1))/$TOTAL_RUNS] Launching: $vd_mode | seed $seed | utd $utd on GPU $device_num"
     echo "   Logdir: $logdir"
 
     CUDA_VISIBLE_DEVICES=$device_num XLA_FLAGS="--xla_gpu_enable_triton_gemm=false" python examples/train_continual.py \
@@ -105,7 +120,7 @@ for setting_spec in "${SETTINGS[@]}"; do
         --vd_mode=${vd_mode} \
         --save_dir=${logdir} \
         --seed=${seed} \
-        --utd=${UTD} \
+        --utd=${utd} \
         --config.redo.redo_enabled=${REDO_ENABLED} \
         --config.redo.log_item=${REDO_LOG_ITEM} \
         --config.redo.frequency=${REDO_FREQUENCY} \
