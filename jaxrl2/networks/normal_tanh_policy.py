@@ -4,7 +4,7 @@ import distrax
 import flax.linen as nn
 import jax.numpy as jnp
 
-from jaxrl2.networks import MLP
+from jaxrl2.networks import MLP, build_mlp
 from jaxrl2.networks.constants import default_init
 
 
@@ -63,9 +63,16 @@ class NormalTanhPolicy(nn.Module):
     def __call__(
         self, observations: jnp.ndarray, training: bool = False
     ) -> distrax.Distribution:
-        outputs = MLP(
-            self.hidden_dims, activate_final=True, dropout_rate=self.dropout_rate
+        # outputs = MLP(
+        #     self.hidden_dims, activate_final=True, dropout_rate=self.dropout_rate
+        # )(observations, training=training)
+        outputs = build_mlp(
+            vd_mode="RN_first_last",
+            hidden_dims=self.hidden_dims,
+            activate_final=True,
+            dropout_rate=self.dropout_rate,
         )(observations, training=training)
+            
 
         means = nn.Dense(self.action_dim, kernel_init=default_init())(outputs)
 
