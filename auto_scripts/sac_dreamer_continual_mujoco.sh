@@ -28,7 +28,7 @@ REDO_FREQUENCY=10000   # matches dreamerv3 frequency: 10000
 
 # Base log directory
 BASE_LOGDIR=./logdir
-UTD=(4)
+UTD=(1)
 
 # ============= Settings Definition =============
 # Format: "vd_mode|seed"
