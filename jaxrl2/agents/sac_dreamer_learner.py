@@ -98,7 +98,7 @@ class _SiLUMLP(nn.Module):
                         x, deterministic=not training)
                 if self.is_mutable_collection('intermediates'):
                     self.sow('intermediates', f'layer_{i}_act', x)
-                    self.sow('intermediates', f'layer_{i}_noised_act', x)
+                    # self.sow('intermediates', f'layer_{i}_noised_act', x)
         return x
 
 

@@ -197,12 +197,42 @@ def main(_):
                     elif k in _TRAIN_REMAP:
                         log_dict[_TRAIN_REMAP[k]] = v
                     elif '/redo/' in k:
-                        # e.g. actor/redo/erank → act_redo/actor/erank
+                        # Convert to dreamer naming: act_redo/{rank_type}/{net_prefix}_linear{i}
+                        # e.g. actor/redo/erank/layer_0_act → act_redo/erank/pol_mlp_linear0
+                        #      critic/redo/srank/layer_1_act → act_redo/srank/val_mlp_linear1
+                        _NET_PREFIX = {'actor': 'pol_mlp', 'critic': 'val_mlp'}
                         net, _, rest = k.partition('/redo/')
-                        log_dict[f'act_redo/{net}/{rest}'] = v
+                        rank_type, _, lname_raw = rest.partition('/')
+                        if lname_raw.startswith('layer_') and lname_raw.endswith('_act'):
+                            idx = lname_raw[len('layer_'):-len('_act')]
+                            net_prefix = _NET_PREFIX.get(net, net)
+                            log_dict[f'act_redo/{rank_type}/{net_prefix}_linear{idx}'] = v
+                        else:
+                            # fallback for non-standard names (e.g. Dormant_*, Act_Mean/*)
+                            log_dict[f'act_redo/{net}/{rest}'] = v
                     elif '/grad_redo/' in k:
+                        # Convert to dreamer naming: grad_redo/{rank_type}/{net_prefix}_linear{i}
+                        # e.g. actor/grad_redo/GradDormant_0.1/layer_0 → grad_redo/GradDormant_0.1/pol_mlp_linear0
+                        #      critic_0/grad_redo/Grad_Mean/layer_1    → grad_redo/Grad_Mean/val_mlp_linear1
+                        # critic_1 (second Q ensemble member) is skipped — only critic_0 is logged.
+                        _NET_PREFIX_G = {'actor': 'pol_mlp', 'critic': 'val_mlp'}
                         net, _, rest = k.partition('/grad_redo/')
-                        log_dict[f'grad_redo/{net}/{rest}'] = v
+                        rank_type, _, lname_raw = rest.partition('/')
+                        # handle vmapped suffix: critic_0 → base=critic, keep; critic_1 → skip
+                        parts = net.rsplit('_', 1)
+                        if len(parts) == 2 and parts[1].isdigit():
+                            if parts[1] != '0':
+                                continue  # skip critic_1, critic_2, …
+                            net_base = parts[0]
+                        else:
+                            net_base = net
+                        if lname_raw.startswith('layer_'):
+                            idx = lname_raw[len('layer_'):]
+                            net_prefix = _NET_PREFIX_G.get(net_base, net_base)
+                            log_dict[f'grad_redo/{rank_type}/{net_prefix}_linear{idx}'] = v
+                        else:
+                            # fallback for non-standard names
+                            log_dict[f'grad_redo/{net_base}/{rest}'] = v
                     else:
                         log_dict[f'train/{k}'] = v
                 wandb.log(log_dict, step=global_step)
