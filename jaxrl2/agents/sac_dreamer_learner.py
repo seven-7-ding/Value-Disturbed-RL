@@ -657,3 +657,622 @@ def _compute_critic_grads_dreamer(actor, critic, target_params, temp, batch,
 
     grads, _ = jax.grad(critic_loss_fn, has_aux=True)(critic.params)
     return grads
+
+
+# ===========================================================================
+# TwoHot distributional critic — mirrors DreamerV3 value head (symexp_twohot)
+# ===========================================================================
+
+def _symlog(x: jnp.ndarray) -> jnp.ndarray:
+    return jnp.sign(x) * jnp.log1p(jnp.abs(x))
+
+
+def _symexp(x: jnp.ndarray) -> jnp.ndarray:
+    return jnp.sign(x) * jnp.expm1(jnp.abs(x))
+
+
+def _make_twohot_bins(num_bins: int) -> jnp.ndarray:
+    """Compute symexp-spaced bins identical to DreamerV3 symexp_twohot."""
+    if num_bins % 2 == 1:
+        half = jnp.linspace(-20.0, 0.0, (num_bins - 1) // 2 + 1, dtype=jnp.float32)
+        half = _symexp(half)
+        bins = jnp.concatenate([half, -half[:-1][::-1]], axis=0)
+    else:
+        half = jnp.linspace(-20.0, 0.0, num_bins // 2, dtype=jnp.float32)
+        half = _symexp(half)
+        bins = jnp.concatenate([half, -half[::-1]], axis=0)
+    return bins
+
+
+def _twohot_pred(logits: jnp.ndarray, bins: jnp.ndarray) -> jnp.ndarray:
+    """Expected value from TwoHot logits.  Mirrors TwoHot.pred() in outs.py.
+
+    Uses a symmetric summation to cancel floating-point bias at init (when
+    logits are 0 and probabilities are uniform).
+
+    Args:
+        logits: [..., num_bins]
+        bins:   [num_bins]
+    Returns:
+        Expected value [...].
+    """
+    probs = jax.nn.softmax(logits, axis=-1)
+    n = bins.shape[0]
+    if n % 2 == 1:
+        m = (n - 1) // 2
+        p1, p2, p3 = probs[..., :m], probs[..., m:m + 1], probs[..., m + 1:]
+        b1, b2, b3 = bins[:m], bins[m:m + 1], bins[m + 1:]
+        return (p2 * b2).sum(-1) + ((p1 * b1)[..., ::-1] + (p3 * b3)).sum(-1)
+    else:
+        h = n // 2
+        p1, p2 = probs[..., :h], probs[..., h:]
+        b1, b2 = bins[:h], bins[h:]
+        return ((p1 * b1)[..., ::-1] + (p2 * b2)).sum(-1)
+
+
+def _twohot_loss(logits: jnp.ndarray, target: jnp.ndarray,
+                 bins: jnp.ndarray) -> jnp.ndarray:
+    """Cross-entropy loss with two-hot encoded target.  Mirrors TwoHot.loss().
+
+    Args:
+        logits: [..., num_bins]
+        target: [...] scalar targets
+        bins:   [num_bins]
+    Returns:
+        Per-element loss [...].
+    """
+    target = jax.lax.stop_gradient(target.astype(jnp.float32))
+    nb = bins.shape[0]
+    below = (bins <= target[..., None]).sum(-1).astype(jnp.int32) - 1
+    above = nb - (bins > target[..., None]).sum(-1).astype(jnp.int32)
+    below = jnp.clip(below, 0, nb - 1)
+    above = jnp.clip(above, 0, nb - 1)
+    equal = (below == above)
+    dist_to_below = jnp.where(equal, 1.0, jnp.abs(bins[below] - target))
+    dist_to_above = jnp.where(equal, 1.0, jnp.abs(bins[above] - target))
+    total = dist_to_below + dist_to_above
+    weight_below = dist_to_above / total
+    weight_above = dist_to_below / total
+    target_twohot = (
+        jax.nn.one_hot(below, nb) * weight_below[..., None] +
+        jax.nn.one_hot(above, nb) * weight_above[..., None])
+    log_pred = logits - jax.scipy.special.logsumexp(logits, axis=-1, keepdims=True)
+    return -(target_twohot * log_pred).sum(-1)
+
+
+# ---------------------------------------------------------------------------
+# TwoHot critic networks
+# ---------------------------------------------------------------------------
+
+class _StateActionTwoHotSiLU(nn.Module):
+    """Single Q-function with TwoHot distributional output.
+
+    (obs, act) → logits [..., num_bins]
+    Mirrors DreamerV3 value head: 3-layer SiLU+RMSNorm MLP → Linear(num_bins).
+    Output layer is zero-initialised (outscale=0.0 in DreamerV3), giving
+    uniform logits at init so that pred() = 0.
+    """
+    hidden_dims: Sequence[int]
+    num_bins: int = 255
+
+    @nn.compact
+    def __call__(self, observations: jnp.ndarray, actions: jnp.ndarray,
+                 training: bool = False) -> jnp.ndarray:
+        inputs = {"states": observations, "actions": actions}
+        x = _SiLUMLP(self.hidden_dims, activate_final=True)(inputs, training=training)
+        logits = nn.Dense(
+            self.num_bins,
+            kernel_init=nn.initializers.zeros,
+            bias_init=nn.initializers.zeros,
+            name='logits',
+        )(x)
+        return logits
+
+
+class StateActionTwoHotEnsembleSiLU(nn.Module):
+    """Double Q-function ensemble with TwoHot distributional output.
+
+    Identical vmap structure to StateActionEnsembleSiLU but each member
+    outputs logits of shape [..., num_bins] instead of scalars.
+    The full ensemble output shape is [num_qs, batch, num_bins].
+    """
+    hidden_dims: Sequence[int]
+    num_qs: int = 2
+    num_bins: int = 255
+
+    @nn.compact
+    def __call__(self, states, actions, training: bool = False):
+        VmapCritic = nn.vmap(
+            _StateActionTwoHotSiLU,
+            variable_axes={"params": 0, "intermediates": 0},
+            split_rngs={"params": True},
+            in_axes=None,
+            out_axes=0,
+            axis_size=self.num_qs,
+        )
+        return VmapCritic(self.hidden_dims, self.num_bins)(states, actions, training)
+
+
+# ---------------------------------------------------------------------------
+# JIT-compiled update step for distributional SAC
+# ---------------------------------------------------------------------------
+
+@functools.partial(jax.jit, static_argnames=(
+    "backup_entropy", "critic_reduction", "num_bins"))
+def _update_jit_dreamer_dist(
+    rng: PRNGKey,
+    actor: TrainState,
+    critic: TrainState,
+    target_critic_params: Params,
+    temp: TrainState,
+    batch: FrozenDict,
+    discount: float,
+    tau: float,
+    target_entropy: float,
+    backup_entropy: bool,
+    critic_reduction: str,
+    num_bins: int,
+) -> Tuple[PRNGKey, TrainState, TrainState, Params, TrainState, Dict]:
+    """SAC update with TwoHot distributional critic (mirrors DreamerV3 value).
+
+    Critic loss  : TwoHot cross-entropy  (not MSE)
+    Actor Q-value: _twohot_pred() expected value from TwoHot distribution
+    Everything else (temperature, Bellman target formula, soft update) is
+    identical to the standard SAC / SACDreamerLearner update.
+    """
+    bins = _make_twohot_bins(num_bins)
+
+    # ---- Bellman target ----
+    rng, key = jax.random.split(rng)
+    dist = actor.apply_fn({"params": actor.params}, batch["next_observations"])
+    next_actions, next_log_probs = dist.sample_and_log_prob(seed=key)
+
+    target_critic = critic.replace(params=target_critic_params)
+    next_q_logits = target_critic.apply_fn(
+        {"params": target_critic.params},
+        batch["next_observations"], next_actions)
+    # next_q_logits: [num_qs, batch, num_bins]
+    next_qs = _twohot_pred(next_q_logits, bins)  # [num_qs, batch]
+
+    if critic_reduction == "min":
+        next_q = next_qs.min(axis=0)
+    elif critic_reduction == "mean":
+        next_q = next_qs.mean(axis=0)
+    else:
+        next_q = next_qs.min(axis=0)  # default to min
+
+    target_q = batch["rewards"] + discount * batch["masks"] * next_q
+    if backup_entropy:
+        target_q -= (
+            discount * batch["masks"]
+            * temp.apply_fn({"params": temp.params})
+            * next_log_probs)
+
+    # ---- Critic update: TwoHot cross-entropy ----
+    def critic_loss_fn(critic_params: Params) -> Tuple[jnp.ndarray, Dict]:
+        q_logits = critic.apply_fn(
+            {"params": critic_params},
+            batch["observations"], batch["actions"])
+        # q_logits: [num_qs, batch, num_bins]
+        loss = _twohot_loss(q_logits, target_q, bins)  # [num_qs, batch]
+        critic_loss = loss.mean()
+        return critic_loss, {
+            "critic_loss": critic_loss,
+            "q": _twohot_pred(q_logits, bins).mean(),
+            "target_actor_entropy": -next_log_probs.mean(),
+        }
+
+    grads, critic_info = jax.grad(critic_loss_fn, has_aux=True)(critic.params)
+    new_critic = critic.apply_gradients(grads=grads)
+    new_target_critic_params = soft_target_update(
+        new_critic.params, target_critic_params, tau)
+
+    # ---- Actor update: use TwoHot pred() for Q values ----
+    rng, key = jax.random.split(rng)
+
+    def actor_loss_fn(actor_params: Params) -> Tuple[jnp.ndarray, Dict]:
+        dist = actor.apply_fn({"params": actor_params}, batch["observations"])
+        actions, log_probs = dist.sample_and_log_prob(seed=key)
+        q_logits = new_critic.apply_fn(
+            {"params": new_critic.params},
+            batch["observations"], actions)
+        # Use TwoHot pred() — expected Q, not raw logits
+        qs = _twohot_pred(q_logits, bins)   # [num_qs, batch]
+        q = qs.mean(axis=0)
+        loss = (log_probs * temp.apply_fn({"params": temp.params}) - q).mean()
+        return loss, {"actor_loss": loss, "entropy": -log_probs.mean()}
+
+    grads, actor_info = jax.grad(actor_loss_fn, has_aux=True)(actor.params)
+    new_actor = actor.apply_gradients(grads=grads)
+
+    new_temp, alpha_info = update_temperature(
+        temp, actor_info["entropy"], target_entropy)
+
+    return (
+        rng, new_actor, new_critic, new_target_critic_params, new_temp,
+        {**critic_info, **actor_info, **alpha_info})
+
+
+# ---------------------------------------------------------------------------
+# SACDreamerDistLearner
+# ---------------------------------------------------------------------------
+
+class SACDreamerDistLearner(Agent):
+    """SAC with DreamerV3-aligned networks **and** TwoHot distributional critic.
+
+    Architecture differences vs SACDreamerLearner:
+      - Critic  : outputs logits for ``num_bins`` bins (symexp-spaced ±20)
+                  instead of a scalar Q value.
+      - Critic loss : TwoHot cross-entropy (mirrors DreamerV3 value loss).
+      - Actor Q     : _twohot_pred() expected value, not raw critic output.
+
+    Everything else (temperature, target networks, ReDo, reset_agent, …)
+    is identical to SACDreamerLearner.
+    """
+
+    def __init__(
+        self,
+        seed: int,
+        observation_space: gym.Space,
+        action_space: gym.Space,
+        actor_lr: float = 3e-4,
+        critic_lr: float = 3e-4,
+        temp_lr: float = 3e-4,
+        hidden_dims: Sequence[int] = (64, 64, 64),
+        model_size: Optional[str] = None,
+        num_bins: int = 255,
+        discount: float = 0.99,
+        tau: float = 0.005,
+        target_entropy: Optional[float] = None,
+        backup_entropy: bool = True,
+        critic_reduction: str = "min",
+        init_temperature: float = 1.0,
+        vd_mode: str = "disabled",
+        redo: Optional[Dict] = None,
+    ):
+        action_dim = action_space.shape[-1]
+
+        if model_size is not None:
+            if model_size not in SAC_SIZES:
+                raise ValueError(
+                    f"Unknown model_size '{model_size}'. "
+                    f"Valid options: {list(SAC_SIZES.keys())}")
+            hidden_dims = SAC_SIZES[model_size]
+
+        self.target_entropy = (
+            -action_dim / 2 if target_entropy is None else target_entropy)
+        self.backup_entropy = backup_entropy
+        self.critic_reduction = critic_reduction
+        self.tau = tau
+        self.discount = discount
+        self.num_bins = num_bins
+
+        observations = observation_space.sample()
+        actions = action_space.sample()
+
+        rng = jax.random.PRNGKey(seed)
+        rng, actor_key, critic_key, temp_key = jax.random.split(rng, 4)
+
+        if np.all(action_space.low == -1) and np.all(action_space.high == 1):
+            low = high = None
+        else:
+            low = action_space.low
+            high = action_space.high
+
+        # Actor: same NormalTanhPolicySiLU (mean+std, tanh-squashed)
+        actor_def = NormalTanhPolicySiLU(hidden_dims, action_dim, low=low, high=high)
+        actor_params = actor_def.init(actor_key, observations)["params"]
+        actor = TrainState.create(
+            apply_fn=actor_def.apply,
+            params=actor_params,
+            tx=optax.adam(learning_rate=actor_lr),
+        )
+
+        # Critic: TwoHot distributional (logits → num_bins)
+        critic_def = StateActionTwoHotEnsembleSiLU(
+            hidden_dims, num_qs=2, num_bins=num_bins)
+        critic_params = critic_def.init(
+            {"params": critic_key},
+            observations, actions,
+        )["params"]
+        critic = TrainState.create(
+            apply_fn=critic_def.apply,
+            params=critic_params,
+            tx=optax.adam(learning_rate=critic_lr),
+        )
+        target_critic_params = copy.deepcopy(critic_params)
+
+        temp_def = Temperature(init_temperature)
+        temp_params = temp_def.init(temp_key)["params"]
+        temp = TrainState.create(
+            apply_fn=temp_def.apply,
+            params=temp_params,
+            tx=optax.adam(learning_rate=temp_lr),
+        )
+
+        self._actor = actor
+        self._critic = critic
+        self._target_critic_params = target_critic_params
+        self._temp = temp
+        self._rng = rng
+        self._vd_mode = vd_mode
+
+        # Stash for reset_agent()
+        self._actor_def = actor_def
+        self._critic_def = critic_def
+        self._temp_def = temp_def
+        self._actor_lr = actor_lr
+        self._critic_lr = critic_lr
+        self._temp_lr = temp_lr
+        self._init_temperature = init_temperature
+        self._observations_sample = observations
+        self._actions_sample = actions
+
+        # ReDo
+        redo = redo or {}
+        redo_kw = dict(
+            tau=redo.get('tau', 0.05),
+            mode=redo.get('mode', 'threshold'),
+            frequency=redo.get('frequency', 1000),
+            log_item=redo.get('log_item', 'disabled'),
+            rank_threshold=redo.get('rank_threshold', 0.99),
+            reset_start=redo.get('reset_start', 0),
+            reset_end=redo.get('reset_end', 0),
+        )
+        self._rank_threshold = redo_kw['rank_threshold']
+        skip = redo.get('skip_last_layer', False)
+        self._actor_redo = SACReDo(name='actor', **redo_kw, skip_last_layer=skip) \
+            if redo.get('redo_enabled', False) else None
+        self._critic_redo = SACReDo(name='critic', **redo_kw, skip_last_layer=skip) \
+            if redo.get('redo_enabled', False) else None
+        grad_kw = {k: v for k, v in redo_kw.items() if k != 'rank_threshold'}
+        self._actor_grad_redo = SACGradientReDo(name='actor', **grad_kw) \
+            if redo.get('grad_redo_enabled', False) else None
+        self._critic_grad_redo = SACGradientReDo(name='critic', **grad_kw) \
+            if redo.get('grad_redo_enabled', False) else None
+
+    # ------------------------------------------------------------------
+    # Reset
+    # ------------------------------------------------------------------
+
+    def reset_agent(self) -> None:
+        self._rng, actor_key, critic_key, temp_key = jax.random.split(self._rng, 4)
+
+        actor_params = self._actor_def.init(
+            actor_key, self._observations_sample)["params"]
+        self._actor = self._actor.replace(
+            params=actor_params,
+            opt_state=optax.adam(learning_rate=self._actor_lr).init(actor_params),
+            step=0,
+        )
+
+        critic_params = self._critic_def.init(
+            {"params": critic_key},
+            self._observations_sample, self._actions_sample,
+        )["params"]
+        self._critic = self._critic.replace(
+            params=critic_params,
+            opt_state=optax.adam(learning_rate=self._critic_lr).init(critic_params),
+            step=0,
+        )
+        self._target_critic_params = copy.deepcopy(critic_params)
+
+        temp_params = self._temp_def.init(temp_key)["params"]
+        self._temp = self._temp.replace(
+            params=temp_params,
+            opt_state=optax.adam(learning_rate=self._temp_lr).init(temp_params),
+            step=0,
+        )
+        for obj in (self._actor_redo, self._critic_redo,
+                    self._actor_grad_redo, self._critic_grad_redo):
+            if obj is not None:
+                obj._step = 0
+
+    # ------------------------------------------------------------------
+    # Inference (reuse JIT helpers from SACDreamerLearner)
+    # ------------------------------------------------------------------
+
+    def eval_actions(self, observations: np.ndarray) -> np.ndarray:
+        actions = _eval_actions_tanh_mean_jit(self._actor, observations)
+        return np.asarray(actions)
+
+    def sample_actions(self, observations: np.ndarray) -> np.ndarray:
+        rng, key = jax.random.split(self._rng)
+        self._rng = rng
+        actions = _sample_actions_jit(key, self._actor, observations)
+        return np.asarray(actions)
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def update(self, batch: FrozenDict) -> Dict[str, float]:
+        (
+            new_rng,
+            new_actor,
+            new_critic,
+            new_target_critic_params,
+            new_temp,
+            info,
+        ) = _update_jit_dreamer_dist(
+            self._rng,
+            self._actor,
+            self._critic,
+            self._target_critic_params,
+            self._temp,
+            batch,
+            self.discount,
+            self.tau,
+            self.target_entropy,
+            self.backup_entropy,
+            self.critic_reduction,
+            self.num_bins,
+        )
+        self._rng = new_rng
+        self._actor = new_actor
+        self._critic = new_critic
+        self._target_critic_params = new_target_critic_params
+        self._temp = new_temp
+
+        # ReDo analysis
+        redo_due = (
+            (self._actor_redo is not None and self._actor_redo.should_run()) or
+            (self._critic_redo is not None and self._critic_redo.should_run()) or
+            (self._actor_grad_redo is not None and self._actor_grad_redo.should_run()) or
+            (self._critic_grad_redo is not None and self._critic_grad_redo.should_run())
+        )
+        if redo_due:
+            obs     = np.asarray(batch['observations'])
+            actions = np.asarray(batch['actions'])
+            info.update(self._apply_act_redo_dist(obs, actions))
+            info.update(self._apply_grad_redo_dist(batch))
+        else:
+            for obj in (self._actor_redo, self._critic_redo,
+                        self._actor_grad_redo, self._critic_grad_redo):
+                if obj is not None:
+                    obj._step += 1
+
+        return info
+
+    def collect_noised_act_stats(self, obs: np.ndarray,
+                                 actions: np.ndarray) -> Dict:
+        return {}
+
+    # ------------------------------------------------------------------
+    # Internal ReDo helpers
+    # ------------------------------------------------------------------
+
+    def _collect_actor_acts_dist(self, obs: np.ndarray) -> Dict:
+        _, state = self._actor.apply_fn(
+            {'params': self._actor.params},
+            obs,
+            mutable=['intermediates'],
+        )
+        intermediates = state.get('intermediates', {})
+        flat = {}
+        def _walk(node, prefix):
+            if not (isinstance(node, dict) or hasattr(node, 'items')):
+                flat[prefix] = node[0] if isinstance(node, tuple) else node
+                return
+            for k, v in node.items():
+                _walk(v, f'{prefix}/{k}' if prefix else k)
+        _walk(intermediates, '')
+        return flat
+
+    def _collect_critic_acts_dist(self, obs: np.ndarray,
+                                   actions: np.ndarray) -> Dict:
+        _, state = self._critic.apply_fn(
+            {'params': self._critic.params},
+            obs, actions,
+            mutable=['intermediates'],
+        )
+        intermediates = state.get('intermediates', {})
+        flat = {}
+        def _walk(node, prefix):
+            if not (isinstance(node, dict) or hasattr(node, 'items')):
+                v = node[0] if isinstance(node, tuple) and len(node) == 1 else node
+                if hasattr(v, 'ndim') and v.ndim >= 2:
+                    v = v[0]
+                flat[prefix] = v
+                return
+            for k, v in node.items():
+                _walk(v, f'{prefix}/{k}' if prefix else k)
+        _walk(intermediates, '')
+        return flat
+
+    def _apply_act_redo_dist(self, obs: np.ndarray,
+                              actions: np.ndarray) -> Dict:
+        info = {}
+        if self._actor_redo is not None and self._actor_redo.should_run():
+            self._rng, key = jax.random.split(self._rng)
+            acts = self._collect_actor_acts_dist(obs)
+            new_p, mets = self._actor_redo.step(self._actor.params, acts, key)
+            self._actor = self._actor.replace(params=new_p)
+            info.update(mets)
+        elif self._actor_redo is not None:
+            self._actor_redo._step += 1
+
+        if self._critic_redo is not None and self._critic_redo.should_run():
+            self._rng, key = jax.random.split(self._rng)
+            acts = self._collect_critic_acts_dist(obs, actions)
+            new_p, mets = self._critic_redo.step(self._critic.params, acts, key)
+            self._critic = self._critic.replace(params=new_p)
+            info.update(mets)
+        elif self._critic_redo is not None:
+            self._critic_redo._step += 1
+
+        return info
+
+    def _apply_grad_redo_dist(self, batch: FrozenDict) -> Dict:
+        info = {}
+        if self._actor_grad_redo is not None and self._actor_grad_redo.should_run():
+            self._rng, key = jax.random.split(self._rng)
+            grads = _compute_actor_grads_dist(
+                self._actor, self._critic, self._temp, batch, self.num_bins)
+            new_p, _, mets = self._actor_grad_redo.step(
+                self._actor.params, grads, key)
+            self._actor = self._actor.replace(params=new_p)
+            info.update(mets)
+        elif self._actor_grad_redo is not None:
+            self._actor_grad_redo._step += 1
+
+        if self._critic_grad_redo is not None and self._critic_grad_redo.should_run():
+            self._rng, key = jax.random.split(self._rng)
+            grads = _compute_critic_grads_dist(
+                self._actor, self._critic, self._target_critic_params,
+                self._temp, batch, self.discount, self.backup_entropy,
+                self.critic_reduction, self.num_bins)
+            new_p, _, mets = self._critic_grad_redo.step(
+                self._critic.params, grads, key)
+            self._critic = self._critic.replace(params=new_p)
+            info.update(mets)
+        elif self._critic_grad_redo is not None:
+            self._critic_grad_redo._step += 1
+
+        return info
+
+
+def _compute_actor_grads_dist(actor, critic, temp, batch, num_bins):
+    """Compute actor gradients using TwoHot pred() for Q values."""
+    bins = _make_twohot_bins(num_bins)
+    rng = jax.random.PRNGKey(0)
+
+    def loss_fn(actor_params):
+        dist = actor.apply_fn({'params': actor_params}, batch['observations'])
+        actions, log_probs = dist.sample_and_log_prob(seed=rng)
+        q_logits = critic.apply_fn(
+            {'params': critic.params}, batch['observations'], actions)
+        qs = _twohot_pred(q_logits, bins)
+        q = qs.mean(axis=0)
+        return (log_probs * temp.apply_fn({'params': temp.params}) - q).mean(), {}
+
+    grads, _ = jax.grad(loss_fn, has_aux=True)(actor.params)
+    return grads
+
+
+def _compute_critic_grads_dist(actor, critic, target_params, temp, batch,
+                                discount, backup_entropy, critic_reduction,
+                                num_bins):
+    """Compute critic gradients using TwoHot cross-entropy loss."""
+    bins = _make_twohot_bins(num_bins)
+    rng = jax.random.PRNGKey(0)
+    target_critic = critic.replace(params=target_params)
+    dist = actor.apply_fn({'params': actor.params}, batch['next_observations'])
+    next_actions, next_log_probs = dist.sample_and_log_prob(seed=rng)
+    next_q_logits = target_critic.apply_fn(
+        {'params': target_params}, batch['next_observations'], next_actions)
+    next_qs = _twohot_pred(next_q_logits, bins)
+    next_q = (next_qs.min(axis=0) if critic_reduction == 'min'
+               else next_qs.mean(axis=0))
+    target_q = batch['rewards'] + discount * batch['masks'] * next_q
+    if backup_entropy:
+        target_q -= (discount * batch['masks'] *
+                     temp.apply_fn({'params': temp.params}) * next_log_probs)
+
+    def critic_loss_fn(critic_params):
+        q_logits = critic.apply_fn(
+            {'params': critic_params}, batch['observations'], batch['actions'])
+        return _twohot_loss(q_logits, target_q, bins).mean(), {}
+
+    grads, _ = jax.grad(critic_loss_fn, has_aux=True)(critic.params)
+    return grads
