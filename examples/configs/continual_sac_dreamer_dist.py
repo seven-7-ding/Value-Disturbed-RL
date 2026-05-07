@@ -43,4 +43,19 @@ def get_config():
     redo.reset_end         = 0
     config.redo = redo
 
+    # ---------- Optimizer (mirrors dreamerv3/configs.yaml opt block) ----------
+    opt = ml_collections.ConfigDict()
+    opt.agc      = 0.3       # adaptive gradient clipping ratio
+    opt.eps      = 1e-20     # RMS denominator epsilon
+    opt.beta1    = 0.9       # momentum decay
+    opt.beta2    = 0.999     # RMS decay
+    opt.momentum = True      # use first-moment accumulation
+    opt.nesterov = False     # Nesterov momentum
+    opt.wd       = 0.0       # weight decay (0 = disabled)
+    opt.wdregex  = '/kernel$'  # regex selecting params for weight decay
+    opt.schedule = 'const'   # lr schedule: 'const' | 'linear' | 'cosine'
+    opt.warmup   = 1000      # linear warmup steps
+    opt.anneal   = 0         # total steps for non-const schedule
+    config.opt = opt
+
     return config

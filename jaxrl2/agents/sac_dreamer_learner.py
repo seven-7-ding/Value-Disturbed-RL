@@ -6,7 +6,7 @@ Network design (matching dreamerv3/configs.yaml defaults):
   - Normalisation : RMSNorm          (dreamerv3 norm: rms)  ← per-layer, after Dense
   - Layer order   : Dense → RMSNorm → SiLU
   - Weight init   : default Xavier uniform (Flax default)
-  - Optimiser     : Adam, lr=3e-4 for actor/critic/temp (standard SAC)
+  - Optimiser     : DreamerV3-aligned (AGC→RMS→momentum→warmup-LR)
 
 Everything else (temperature entropy tuning, ReDo, VD-perturbation, etc.)
 is identical to the base SACLearner so the two algorithms can be compared
@@ -15,6 +15,7 @@ under the same continual-learning harness.
 
 import copy
 import functools
+import re as _re
 from typing import Dict, Optional, Sequence, Tuple
 
 import gym
@@ -37,6 +38,145 @@ from jaxrl2.utils.target_update import soft_target_update
 from jaxrl2.utils.redo import SACReDo, SACGradientReDo
 
 import distrax
+
+
+# ---------------------------------------------------------------------------
+# DreamerV3-aligned optimizer
+# Mirrors dreamerv3/agent.py _make_opt() + embodied/jax/opt.py primitives.
+# Chain: AGC → RMS-scaling → momentum → lr-schedule (with warmup).
+# ---------------------------------------------------------------------------
+
+def _clip_by_agc(clip: float = 0.3, pmin: float = 1e-3) -> optax.GradientTransformation:
+    """Adaptive gradient clipping (Brock et al., 2021)."""
+    def init_fn(params):
+        return ()
+
+    def update_fn(updates, state, params=None):
+        def fn(param, update):
+            unorm = jnp.linalg.norm(update.flatten(), 2)
+            pnorm = jnp.linalg.norm(param.flatten(), 2)
+            upper = clip * jnp.maximum(pmin, pnorm)
+            return update * (1 / jnp.maximum(1.0, unorm / upper))
+        updates = jax.tree_util.tree_map(fn, params, updates) if clip else updates
+        return updates, ()
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _scale_by_rms(
+    beta: float = 0.999,
+    eps: float = 1e-20,
+) -> optax.GradientTransformation:
+    """Adam-style second-moment scaling with bias correction (no sqrt(1-β²) denom)."""
+    def init_fn(params):
+        nu = jax.tree_util.tree_map(lambda t: jnp.zeros_like(t, jnp.float32), params)
+        step = jnp.zeros((), jnp.int32)
+        return (step, nu)
+
+    def update_fn(updates, state, params=None):
+        step, nu = state
+        step = optax.safe_int32_increment(step)
+        nu = jax.tree_util.tree_map(
+            lambda v, u: beta * v + (1 - beta) * (u * u), nu, updates)
+        nu_hat = optax.bias_correction(nu, beta, step)
+        updates = jax.tree_util.tree_map(
+            lambda u, v: u / (jnp.sqrt(v) + eps), updates, nu_hat)
+        return updates, (step, nu)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _scale_by_momentum(
+    beta: float = 0.9,
+    nesterov: bool = False,
+) -> optax.GradientTransformation:
+    """Bias-corrected first-moment (momentum) transform."""
+    def init_fn(params):
+        mu = jax.tree_util.tree_map(lambda t: jnp.zeros_like(t), params)
+        step = jnp.zeros((), jnp.int32)
+        return (step, mu)
+
+    def update_fn(updates, state, params=None):
+        step, mu = state
+        step = optax.safe_int32_increment(step)
+        mu = optax.update_moment(updates, mu, beta, 1)
+        if nesterov:
+            mu2 = optax.update_moment(updates, mu, beta, 1)
+            mu_hat = optax.bias_correction(mu2, beta, step)
+        else:
+            mu_hat = optax.bias_correction(mu, beta, step)
+        return mu_hat, (step, mu)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+def _make_dreamer_opt(
+    lr: float,
+    agc: float = 0.3,
+    eps: float = 1e-20,
+    beta1: float = 0.9,
+    beta2: float = 0.999,
+    momentum: bool = True,
+    nesterov: bool = False,
+    wd: float = 0.0,
+    wdregex: str = r'/kernel$',
+    schedule: str = 'const',
+    warmup: int = 1000,
+    anneal: int = 0,
+) -> optax.GradientTransformation:
+    """Reconstruct DreamerV3's optimizer chain.
+
+    Exactly mirrors dreamerv3/agent.py _make_opt() signature and logic.
+    Chain: AGC → RMS-scale → (optional) momentum → (optional) WD → lr-schedule.
+
+    Args:
+        lr       : Peak learning rate.
+        agc      : AGC clip ratio (0 = disabled).  DreamerV3 default: 0.3.
+        eps      : RMS denominator epsilon.         DreamerV3 default: 1e-20.
+        beta1    : Momentum decay.                  DreamerV3 default: 0.9.
+        beta2    : RMS decay.                       DreamerV3 default: 0.999.
+        momentum : Whether to apply first-moment.  DreamerV3 default: True.
+        nesterov : Nesterov momentum.               DreamerV3 default: False.
+        wd       : Weight-decay coefficient.        DreamerV3 default: 0.0.
+        wdregex  : Regex matching params to decay.  DreamerV3 default: '/kernel$'.
+        schedule : LR schedule ('const'/'linear'/'cosine').
+        warmup   : Linear warmup steps.             DreamerV3 default: 1000.
+        anneal   : Total steps for non-const schedule (0 = unused).
+    """
+    chain = []
+    chain.append(_clip_by_agc(agc))
+    chain.append(_scale_by_rms(beta2, eps))
+    if momentum:
+        chain.append(_scale_by_momentum(beta1, nesterov))
+    if wd:
+        pattern = _re.compile(wdregex)
+        def _wd_mask(params):
+            """Boolean pytree: True for params whose path matches wdregex."""
+            try:
+                return jax.tree_util.tree_map_with_path(
+                    lambda path, _: bool(pattern.search(
+                        '/' + '/'.join(
+                            getattr(p, 'key', str(p)) for p in path))),
+                    params)
+            except AttributeError:
+                # Fallback for older JAX: apply decay to all leaves.
+                return jax.tree_util.tree_map(lambda _: True, params)
+        chain.append(optax.add_decayed_weights(wd, _wd_mask))
+    assert anneal > 0 or schedule == 'const', \
+        f"anneal must be > 0 for schedule='{schedule}'"
+    if schedule == 'const':
+        sched = optax.constant_schedule(lr)
+    elif schedule == 'linear':
+        sched = optax.linear_schedule(lr, 0.1 * lr, anneal - warmup)
+    elif schedule == 'cosine':
+        sched = optax.cosine_decay_schedule(lr, anneal - warmup, 0.1 * lr)
+    else:
+        raise NotImplementedError(f"Unknown schedule: {schedule!r}")
+    if warmup:
+        ramp = optax.linear_schedule(0.0, lr, warmup)
+        sched = optax.join_schedules([ramp, sched], [warmup])
+    chain.append(optax.scale_by_learning_rate(sched))
+    return optax.chain(*chain)
 
 
 # ---------------------------------------------------------------------------
@@ -273,6 +413,7 @@ class SACDreamerLearner(Agent):
         init_temperature: float = 1.0,
         vd_mode: str = "disabled",
         redo: Optional[Dict] = None,
+        opt: Optional[Dict] = None,
     ):
         action_dim = action_space.shape[-1]
 
@@ -305,13 +446,30 @@ class SACDreamerLearner(Agent):
             low = action_space.low
             high = action_space.high
 
+        # ---- optimizer hyperparams (mirrors dreamerv3/configs.yaml opt block) ----
+        opt = opt or {}
+        opt_kwargs = dict(
+            agc      = opt.get('agc',      0.3),
+            eps      = opt.get('eps',      1e-20),
+            beta1    = opt.get('beta1',    0.9),
+            beta2    = opt.get('beta2',    0.999),
+            momentum = opt.get('momentum', True),
+            nesterov = opt.get('nesterov', False),
+            wd       = opt.get('wd',       0.0),
+            wdregex  = opt.get('wdregex',  r'/kernel$'),
+            schedule = opt.get('schedule', 'const'),
+            warmup   = opt.get('warmup',   1000),
+            anneal   = opt.get('anneal',   0),
+        )
+        self._opt_kwargs = opt_kwargs
+
         # ---- networks ----
         actor_def = NormalTanhPolicySiLU(hidden_dims, action_dim, low=low, high=high)
         actor_params = actor_def.init(actor_key, observations)["params"]
         actor = TrainState.create(
             apply_fn=actor_def.apply,
             params=actor_params,
-            tx=optax.adam(learning_rate=actor_lr),
+            tx=_make_dreamer_opt(actor_lr, **opt_kwargs),
         )
 
         critic_def = StateActionEnsembleSiLU(hidden_dims, num_qs=2)
@@ -322,7 +480,7 @@ class SACDreamerLearner(Agent):
         critic = TrainState.create(
             apply_fn=critic_def.apply,
             params=critic_params,
-            tx=optax.adam(learning_rate=critic_lr),
+            tx=_make_dreamer_opt(critic_lr, **opt_kwargs),
         )
         target_critic_params = copy.deepcopy(critic_params)
 
@@ -331,7 +489,7 @@ class SACDreamerLearner(Agent):
         temp = TrainState.create(
             apply_fn=temp_def.apply,
             params=temp_params,
-            tx=optax.adam(learning_rate=temp_lr),
+            tx=_make_dreamer_opt(temp_lr, **opt_kwargs),
         )
 
         self._actor = actor
@@ -388,7 +546,7 @@ class SACDreamerLearner(Agent):
             actor_key, self._observations_sample)["params"]
         self._actor = self._actor.replace(
             params=actor_params,
-            opt_state=optax.adam(learning_rate=self._actor_lr).init(actor_params),
+            opt_state=_make_dreamer_opt(self._actor_lr, **self._opt_kwargs).init(actor_params),
             step=0,
         )
 
@@ -398,7 +556,7 @@ class SACDreamerLearner(Agent):
         )["params"]
         self._critic = self._critic.replace(
             params=critic_params,
-            opt_state=optax.adam(learning_rate=self._critic_lr).init(critic_params),
+            opt_state=_make_dreamer_opt(self._critic_lr, **self._opt_kwargs).init(critic_params),
             step=0,
         )
         self._target_critic_params = copy.deepcopy(critic_params)
@@ -406,7 +564,7 @@ class SACDreamerLearner(Agent):
         temp_params = self._temp_def.init(temp_key)["params"]
         self._temp = self._temp.replace(
             params=temp_params,
-            opt_state=optax.adam(learning_rate=self._temp_lr).init(temp_params),
+            opt_state=_make_dreamer_opt(self._temp_lr, **self._opt_kwargs).init(temp_params),
             step=0,
         )
         for obj in (self._actor_redo, self._critic_redo,
@@ -929,6 +1087,7 @@ class SACDreamerDistLearner(Agent):
         init_temperature: float = 1.0,
         vd_mode: str = "disabled",
         redo: Optional[Dict] = None,
+        opt: Optional[Dict] = None,
     ):
         action_dim = action_space.shape[-1]
 
@@ -959,13 +1118,30 @@ class SACDreamerDistLearner(Agent):
             low = action_space.low
             high = action_space.high
 
+        # ---- optimizer hyperparams (mirrors dreamerv3/configs.yaml opt block) ----
+        opt = opt or {}
+        opt_kwargs = dict(
+            agc      = opt.get('agc',      0.3),
+            eps      = opt.get('eps',      1e-20),
+            beta1    = opt.get('beta1',    0.9),
+            beta2    = opt.get('beta2',    0.999),
+            momentum = opt.get('momentum', True),
+            nesterov = opt.get('nesterov', False),
+            wd       = opt.get('wd',       0.0),
+            wdregex  = opt.get('wdregex',  r'/kernel$'),
+            schedule = opt.get('schedule', 'const'),
+            warmup   = opt.get('warmup',   1000),
+            anneal   = opt.get('anneal',   0),
+        )
+        self._opt_kwargs = opt_kwargs
+
         # Actor: same NormalTanhPolicySiLU (mean+std, tanh-squashed)
         actor_def = NormalTanhPolicySiLU(hidden_dims, action_dim, low=low, high=high)
         actor_params = actor_def.init(actor_key, observations)["params"]
         actor = TrainState.create(
             apply_fn=actor_def.apply,
             params=actor_params,
-            tx=optax.adam(learning_rate=actor_lr),
+            tx=_make_dreamer_opt(actor_lr, **opt_kwargs),
         )
 
         # Critic: TwoHot distributional (logits → num_bins)
@@ -978,7 +1154,7 @@ class SACDreamerDistLearner(Agent):
         critic = TrainState.create(
             apply_fn=critic_def.apply,
             params=critic_params,
-            tx=optax.adam(learning_rate=critic_lr),
+            tx=_make_dreamer_opt(critic_lr, **opt_kwargs),
         )
         target_critic_params = copy.deepcopy(critic_params)
 
@@ -987,7 +1163,7 @@ class SACDreamerDistLearner(Agent):
         temp = TrainState.create(
             apply_fn=temp_def.apply,
             params=temp_params,
-            tx=optax.adam(learning_rate=temp_lr),
+            tx=_make_dreamer_opt(temp_lr, **opt_kwargs),
         )
 
         self._actor = actor
@@ -1042,7 +1218,7 @@ class SACDreamerDistLearner(Agent):
             actor_key, self._observations_sample)["params"]
         self._actor = self._actor.replace(
             params=actor_params,
-            opt_state=optax.adam(learning_rate=self._actor_lr).init(actor_params),
+            opt_state=_make_dreamer_opt(self._actor_lr, **self._opt_kwargs).init(actor_params),
             step=0,
         )
 
@@ -1052,7 +1228,7 @@ class SACDreamerDistLearner(Agent):
         )["params"]
         self._critic = self._critic.replace(
             params=critic_params,
-            opt_state=optax.adam(learning_rate=self._critic_lr).init(critic_params),
+            opt_state=_make_dreamer_opt(self._critic_lr, **self._opt_kwargs).init(critic_params),
             step=0,
         )
         self._target_critic_params = copy.deepcopy(critic_params)
@@ -1060,7 +1236,7 @@ class SACDreamerDistLearner(Agent):
         temp_params = self._temp_def.init(temp_key)["params"]
         self._temp = self._temp.replace(
             params=temp_params,
-            opt_state=optax.adam(learning_rate=self._temp_lr).init(temp_params),
+            opt_state=_make_dreamer_opt(self._temp_lr, **self._opt_kwargs).init(temp_params),
             step=0,
         )
         for obj in (self._actor_redo, self._critic_redo,

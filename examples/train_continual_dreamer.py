@@ -82,6 +82,7 @@ def main(_):
     kwargs.pop("jax_mem_fraction", None)
     redo_cfg = dict(kwargs.pop("redo", {}))
     redo_cfg["frequency"] = redo_cfg["frequency"] * FLAGS.utd
+    opt_cfg = dict(kwargs.pop("opt", {}))
     # model_size is resolved inside SACDreamerLearner; pass it through.
     # If not present in config, default to None (use hidden_dims directly).
     kwargs.setdefault("model_size", None)
@@ -107,6 +108,7 @@ def main(_):
         env.action_space,
         redo=redo_cfg,
         vd_mode=FLAGS.vd_mode,
+        opt=opt_cfg,
         **kwargs,
     )
 

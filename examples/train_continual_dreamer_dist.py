@@ -121,6 +121,7 @@ def main(_):
     kwargs.pop("jax_mem_fraction", None)
     redo_cfg = dict(kwargs.pop("redo", {}))
     redo_cfg["frequency"] = redo_cfg["frequency"] * FLAGS.utd
+    opt_cfg = dict(kwargs.pop("opt", {}))
     kwargs.setdefault("model_size", None)
 
     num_envs  = FLAGS.num_envs
@@ -152,6 +153,7 @@ def main(_):
         single_act_space,
         redo=redo_cfg,
         vd_mode=FLAGS.vd_mode,
+        opt=opt_cfg,
         **kwargs,
     )
 
