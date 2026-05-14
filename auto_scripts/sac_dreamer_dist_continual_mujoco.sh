@@ -19,7 +19,7 @@ ACT_DIM=6
 TASK_STEPS=200000      # individual transitions per task (matches DreamerV3 task_interval=200000)
 TASK_REPEATS=10
 START_TRAINING=10000
-SIZE="size1m"          # DreamerV3 size1m: 3x64 SiLU+RMSNorm
+SIZE="size50m"          # DreamerV3 size1m: 3x64 SiLU+RMSNorm
 
 # Parallel env workers (each step samples NUM_ENVS transitions simultaneously)
 NUM_ENVS=16            # default: 16 parallel envs
